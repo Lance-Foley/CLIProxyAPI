@@ -41,7 +41,8 @@ const (
 )
 
 // StartAutoRefresh launches a background loop that evaluates auth freshness
-// every few seconds and triggers refresh operations when required.
+// every few seconds and triggers refresh operations when required. It also
+// starts the Claude quota re-check loop.
 // Only one loop is kept alive; starting a new one cancels the previous run.
 func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duration) {
 	if interval <= 0 {
@@ -68,6 +69,7 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 
 	loop.rebuild(time.Now())
 	go loop.run(ctx)
+	m.startClaudeQuotaRecheck(parent)
 }
 
 // StopAutoRefresh cancels the background refresh loop, if running.
@@ -81,6 +83,7 @@ func (m *Manager) StopAutoRefresh() {
 	if cancel != nil {
 		cancel()
 	}
+	m.stopClaudeQuotaRecheck()
 	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
 	sel := m.Selector()
 	if stoppable, ok := sel.(StoppableSelector); ok && stoppable != nil {

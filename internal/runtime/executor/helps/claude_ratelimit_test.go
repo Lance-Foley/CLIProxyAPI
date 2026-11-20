@@ -113,7 +113,7 @@ func TestParseClaudeRateLimitReset_AllCases(t *testing.T) {
 		}
 	})
 
-	t.Run("fable-only rejection with 7d_oi reset and retry-after returns nil for exponential backoff", func(t *testing.T) {
+	t.Run("fable-only rejection with 7d_oi reset and retry-after cools until the later 7d_oi reset", func(t *testing.T) {
 		h := make(http.Header)
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
@@ -124,12 +124,15 @@ func TestParseClaudeRateLimitReset_AllCases(t *testing.T) {
 		h.Set("Retry-After", "60")
 
 		got := parseClaudeRateLimitResetWithFuzz(h, now, 0, 0)
-		if got != nil {
-			t.Fatalf("expected nil RetryAfter for fable-only rejection with retry-after, got %v", *got)
+		if got == nil {
+			t.Fatal("expected the 7d_oi reset deadline for a fable-only rejection, got nil")
+		}
+		if *got < 7*24*time.Hour-5*time.Second || *got > 7*24*time.Hour+5*time.Second {
+			t.Fatalf("expected ~7d from the 7d_oi reset, got %v", *got)
 		}
 	})
 
-	t.Run("fable-only rejection with 7d_oi reset only returns nil for exponential backoff", func(t *testing.T) {
+	t.Run("fable-only rejection with 7d_oi reset only cools until the 7d_oi reset", func(t *testing.T) {
 		h := make(http.Header)
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
@@ -139,12 +142,15 @@ func TestParseClaudeRateLimitReset_AllCases(t *testing.T) {
 		h.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(now.Add(7*24*time.Hour).Unix(), 10))
 
 		got := ParseClaudeRateLimitReset(h, now)
-		if got != nil {
-			t.Fatalf("expected nil for fable-only rejection without retry-after, got %v", *got)
+		if got == nil {
+			t.Fatal("expected the 7d_oi reset deadline for a fable-only rejection without retry-after, got nil")
+		}
+		if *got < 7*24*time.Hour-5*time.Second || *got > 7*24*time.Hour+31*time.Second {
+			t.Fatalf("expected ~7d plus fuzz from the 7d_oi reset, got %v", *got)
 		}
 	})
 
-	t.Run("fable-only rejection with allowed_warning on shared window returns nil for exponential backoff", func(t *testing.T) {
+	t.Run("fable-only rejection with allowed_warning on shared window cools until the 7d_oi reset", func(t *testing.T) {
 		h := make(http.Header)
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
@@ -155,8 +161,11 @@ func TestParseClaudeRateLimitReset_AllCases(t *testing.T) {
 		h.Set("Retry-After", "60")
 
 		got := parseClaudeRateLimitResetWithFuzz(h, now, 0, 0)
-		if got != nil {
-			t.Fatalf("expected nil RetryAfter for fable-only rejection with allowed_warning, got %v", *got)
+		if got == nil {
+			t.Fatal("expected the 7d_oi reset deadline for a fable-only rejection with allowed_warning, got nil")
+		}
+		if *got < 7*24*time.Hour-5*time.Second || *got > 7*24*time.Hour+5*time.Second {
+			t.Fatalf("expected ~7d from the 7d_oi reset, got %v", *got)
 		}
 	})
 
@@ -580,8 +589,131 @@ func TestFableOnlyRejectionWithout5hHeadersStaysModelScoped_Issue7197(t *testing
 	if ClaudeHeadersIndicateUnifiedRateLimitRejection(headers) {
 		t.Fatal("Fable-only rejection with 7d allowed and omitted 5h headers was treated as credential-scoped (Issue #7197)")
 	}
+	// The rejected 7d_oi window is a model bucket: the model (not the credential)
+	// cools until its reset, which here equals Retry-After (546534s).
 	got := parseClaudeRateLimitResetWithFuzz(headers, now, 0, 0)
-	if got != nil {
-		t.Fatalf("cooldown = %v, want nil; Fable-only rejection must not adopt multi-day Retry-After or 7d_oi reset", *got)
+	if got == nil || *got != 546534*time.Second {
+		var gotDesc string
+		if got == nil {
+			gotDesc = "nil"
+		} else {
+			gotDesc = got.String()
+		}
+		t.Fatalf("cooldown = %s, want 546534s; a rejected 7d_oi window must cool the model until its reset", gotDesc)
+	}
+}
+
+// liveFableWeeklyRejectionHeaders is the real 429 header set Anthropic returned on
+// 2026-11-20 when only the Fable weekly bucket (7d_oi) was exhausted. Opus still
+// returned 200 on the same account. No 5h headers were present.
+func liveFableWeeklyRejectionHeaders() http.Header {
+	return http.Header{
+		"Anthropic-Ratelimit-Unified-Status":                  []string{"rejected"},
+		"Anthropic-Ratelimit-Unified-7d-Status":               []string{"allowed_warning"},
+		"Anthropic-Ratelimit-Unified-7d-Utilization":          []string{"0.95"},
+		"Anthropic-Ratelimit-Unified-7d_oi-Status":            []string{"rejected"},
+		"Anthropic-Ratelimit-Unified-7d_oi-Utilization":       []string{"1.02"},
+		"Anthropic-Ratelimit-Unified-7d_oi-Reset":             []string{"1795302000"},
+		"Anthropic-Ratelimit-Unified-Reset":                   []string{"1795302000"},
+		"Anthropic-Ratelimit-Unified-Overage-Status":          []string{"rejected"},
+		"Anthropic-Ratelimit-Unified-Overage-Disabled-Reason": []string{"org_level_disabled"},
+		"Anthropic-Ratelimit-Unified-Representative-Claim":    []string{"seven_day_overage_included"},
+		"Retry-After": []string{"118601"},
+	}
+}
+
+func TestLiveFableWeeklyRejectionCoolsModelUntil7dOIReset(t *testing.T) {
+	// now + Retry-After equals the 7d_oi reset in the live capture.
+	now := time.Unix(1795302000-118601, 0)
+	for _, status7d := range []string{"allowed_warning", "allowed"} {
+		t.Run(status7d, func(t *testing.T) {
+			headers := liveFableWeeklyRejectionHeaders()
+			headers.Set("Anthropic-Ratelimit-Unified-7d-Status", status7d)
+
+			if ClaudeHeadersIndicateUnifiedRateLimitRejection(headers) {
+				t.Fatal("Fable weekly rejection was treated as a credential-wide rejection; want model-scoped")
+			}
+			got := parseClaudeRateLimitResetWithFuzz(headers, now, 0, 0)
+			if got == nil || *got != 118601*time.Second {
+				t.Fatalf("cooldown = %v, want 118601s until the 7d_oi reset", got)
+			}
+			body := []byte(`{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}}`)
+			gotForError := ParseClaudeRateLimitResetForError(headers, body, now)
+			if gotForError == nil || *gotForError < 118601*time.Second || *gotForError > 118601*time.Second+30*time.Second {
+				t.Fatalf("ParseClaudeRateLimitResetForError = %v, want 118601s plus fuzz", gotForError)
+			}
+		})
+	}
+}
+
+func TestFableWeeklyRejectionUsesLatestOf7dOIResetAndRetryAfter(t *testing.T) {
+	now := time.Unix(1795302000-118601, 0)
+
+	t.Run("retry-after later than 7d_oi reset wins", func(t *testing.T) {
+		headers := liveFableWeeklyRejectionHeaders()
+		headers.Set("Retry-After", "120000")
+		got := parseClaudeRateLimitResetWithFuzz(headers, now, 0, 0)
+		if got == nil || *got != 120000*time.Second {
+			t.Fatalf("cooldown = %v, want 120000s from the later Retry-After", got)
+		}
+	})
+
+	t.Run("7d_oi reset used when retry-after is missing", func(t *testing.T) {
+		headers := liveFableWeeklyRejectionHeaders()
+		headers.Del("Retry-After")
+		got := parseClaudeRateLimitResetWithFuzz(headers, now, 0, 0)
+		if got == nil || *got != 118601*time.Second {
+			t.Fatalf("cooldown = %v, want 118601s from the 7d_oi reset", got)
+		}
+	})
+
+	t.Run("7d_oi reset beyond the 7-day cap is ignored", func(t *testing.T) {
+		headers := liveFableWeeklyRejectionHeaders()
+		headers.Set("Anthropic-Ratelimit-Unified-7d_oi-Reset", strconv.FormatInt(now.Add(30*24*time.Hour).Unix(), 10))
+		headers.Set("Retry-After", "3600")
+		got := parseClaudeRateLimitResetWithFuzz(headers, now, 0, 0)
+		if got == nil || *got != time.Hour {
+			t.Fatalf("cooldown = %v, want 1h from Retry-After; a reset past the 7-day cap is not a rate-limit window", got)
+		}
+	})
+
+	t.Run("both deadlines beyond the cap fall back to backoff", func(t *testing.T) {
+		headers := liveFableWeeklyRejectionHeaders()
+		headers.Set("Anthropic-Ratelimit-Unified-7d_oi-Reset", strconv.FormatInt(now.Add(30*24*time.Hour).Unix(), 10))
+		headers.Set("Retry-After", strconv.Itoa(30*24*3600))
+		if got := parseClaudeRateLimitResetWithFuzz(headers, now, 0, 0); got != nil {
+			t.Fatalf("cooldown = %v, want nil when every deadline exceeds the 7-day cap", *got)
+		}
+	})
+
+	t.Run("unified reset alone does not set the deadline", func(t *testing.T) {
+		headers := liveFableWeeklyRejectionHeaders()
+		headers.Del("Retry-After")
+		headers.Del("Anthropic-Ratelimit-Unified-7d_oi-Reset")
+		if got := parseClaudeRateLimitResetWithFuzz(headers, now, 0, 0); got != nil {
+			t.Fatalf("cooldown = %v, want nil; only the 7d_oi reset and Retry-After describe the model bucket", *got)
+		}
+	})
+}
+
+func TestPureOverageRejectionWithout7dOIRejectionKeepsBackoff(t *testing.T) {
+	now := time.Unix(1795302000-118601, 0)
+	for _, status7dOI := range []string{"allowed", "allowed_warning", ""} {
+		t.Run("7d_oi_"+status7dOI, func(t *testing.T) {
+			headers := liveFableWeeklyRejectionHeaders()
+			if status7dOI == "" {
+				headers.Del("Anthropic-Ratelimit-Unified-7d_oi-Status")
+			} else {
+				headers.Set("Anthropic-Ratelimit-Unified-7d_oi-Status", status7dOI)
+			}
+			headers.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
+
+			if ClaudeHeadersIndicateUnifiedRateLimitRejection(headers) {
+				t.Fatal("pure overage rejection was treated as a credential-wide rejection")
+			}
+			if got := parseClaudeRateLimitResetWithFuzz(headers, now, 0, 0); got != nil {
+				t.Fatalf("cooldown = %v, want nil; a pure overage refusal must not get a long cooldown", *got)
+			}
+		})
 	}
 }

@@ -242,6 +242,11 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 	status7d := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d-Status")))
 	status7dOI := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d_oi-Status")))
 	overageOnlyRejection := isOverageOrFableOnlyRejection(headers, unifiedStatus, status5h, status7d, status7dOI)
+	// A rejected 7d_oi window is a real weekly bucket for the reporting model (for
+	// example Fable). Its reset is a true model deadline, so the caller keeps the
+	// cooldown model-scoped and cools only that model until the window resets.
+	// A pure overage refusal (7d_oi not rejected) keeps exponential backoff.
+	fableWindowRejection := overageOnlyRejection && status7dOI == "rejected"
 
 	var candidateDeadlines []time.Time
 	var rejectedWindows []string
@@ -259,8 +264,9 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 		rejectedWindows = append(rejectedWindows, "7d_oi")
 	}
 
-	// 1. Retry-After header (skipped for an overage/Fable-only rejection, which does not describe the credential)
-	if !overageOnlyRejection {
+	// 1. Retry-After header (skipped for a pure overage rejection, which does not describe the credential;
+	// kept for a rejected 7d_oi window, where it describes the model bucket)
+	if !overageOnlyRejection || fableWindowRejection {
 		if rawRetryAfter := getHeaderCaseInsensitive(headers, "Retry-After"); rawRetryAfter != "" {
 			if !containsString(rejectedWindows, "retry-after") {
 				rejectedWindows = append(rejectedWindows, "retry-after")
@@ -289,8 +295,8 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 		}
 	}
 
-	// 4. Fable-specific 7-day window reset (only when rejected and not an overage/Fable-only rejection)
-	if status7dOI == "rejected" && !overageOnlyRejection {
+	// 4. Fable-specific 7-day window reset (only when rejected)
+	if status7dOI == "rejected" {
 		if raw := getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d_oi-Reset"); raw != "" {
 			if t, ok := parseUnixOrTimestamp(raw); ok && t.After(now) {
 				candidateDeadlines = append(candidateDeadlines, t)

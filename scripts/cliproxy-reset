@@ -1,0 +1,170 @@
+#!/usr/bin/env -S python3 -I
+"""cliproxy-reset: check blocked Claude accounts on the local CLIProxyAPI, then clear
+the cooldown only on accounts that Anthropic accepts again.
+
+It runs only when you start it. In Claude Code, type:  !cliproxy-reset
+
+  cliproxy-reset              check each blocked account, clear the ones that work
+  cliproxy-reset --list       show blocked accounts, send no request
+  cliproxy-reset --account hey   only accounts whose email contains "hey"
+
+Each check is one 1-token request, pinned to one account, sent through the proxy.
+The management key comes from the macOS Keychain item "cliproxyapi-management"
+(or the env var CLIPROXY_MANAGEMENT_KEY).
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+BASE = os.environ.get("CLIPROXY_BASE_URL", "http://127.0.0.1:8317").rstrip("/") + "/v8/management"
+KEYCHAIN_SERVICE = "cliproxyapi-management"
+DEFAULT_PROBE_MODEL = "claude-opus-5-5"
+
+
+def management_key():
+    key = os.environ.get("CLIPROXY_MANAGEMENT_KEY", "").strip()
+    if key:
+        return key
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, check=True)
+        return out.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        sys.exit(f"No management key. Add it once with:\n"
+                 f"  security add-generic-password -U -a \"$USER\" -s {KEYCHAIN_SERVICE} -w")
+
+
+def call(method, path, key, body=None, timeout=120):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(BASE + path, data=data, method=method, headers={
+        "Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as err:
+        try:
+            payload = json.loads(err.read() or b"{}")
+        except ValueError:
+            payload = {}
+        return err.code, payload
+    except urllib.error.URLError as err:
+        sys.exit(f"Cannot reach the proxy at {BASE}: {err.reason}")
+
+
+def blocked_accounts(key, account_filter):
+    status, payload = call("GET", "/credentials", key)
+    if status != 200:
+        sys.exit(f"GET /credentials failed: HTTP {status} {payload.get('error', '')}")
+    rows = []
+    for cred in payload.get("files", []):
+        if cred.get("provider") != "claude" or cred.get("disabled"):
+            continue
+        if account_filter and account_filter.lower() not in (cred.get("account") or "").lower():
+            continue
+        if cred.get("cooldowns"):
+            rows.append(cred)
+    return rows
+
+
+def until(cooldown):
+    raw = cooldown.get("retry_at") or ""
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone().strftime("%a %H:%M")
+    except ValueError:
+        return raw or "?"
+
+
+def describe(cooldown):
+    if cooldown.get("scope") == "credential":
+        return f"whole account until {until(cooldown)}"
+    return f"{cooldown.get('model_key')} until {until(cooldown)}"
+
+
+def probe(key, auth_index, model):
+    """Return (accepted, detail). accepted is True, False (still limited) or None (other error)."""
+    status, payload = call("POST", "/credentials/verify", key, {"auth_index": auth_index, "model": model})
+    error = str(payload.get("error", ""))
+    if status == 200:
+        return True, "accepted"
+    # After a completed upstream success under an active account cooldown, the proxy
+    # reports credential_superseded instead of verified. The upstream accepted it.
+    if "credential_superseded" in error or "superseded" in error.lower():
+        return True, "accepted"
+    if status == 429:
+        return False, "still limited"
+    return None, f"HTTP {status}: {error[:120]}"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--list", action="store_true", help="show blocked accounts, send no request")
+    parser.add_argument("--account", default="", help="only accounts whose email contains this text")
+    args = parser.parse_args()
+
+    key = management_key()
+    rows = blocked_accounts(key, args.account)
+    if not rows:
+        print("No Claude account is blocked. Nothing to do.")
+        return
+
+    if args.list:
+        for cred in rows:
+            print(f"{cred.get('account')}:")
+            for cooldown in cred["cooldowns"]:
+                print(f"   blocked: {describe(cooldown)}")
+        return
+
+    results = []
+    for cred in rows:
+        account, index = cred.get("account"), cred.get("auth_index")
+        cooldowns = cred["cooldowns"]
+        account_block = next((c for c in cooldowns if c.get("scope") == "credential"), None)
+        model_blocks = [c for c in cooldowns if c.get("scope") == "model" and c.get("reason") != "credential_quota"]
+
+        if account_block:
+            wrapped = [c.get("model_key") for c in cooldowns
+                       if c.get("scope") == "model" and c.get("reason") == "credential_quota" and c.get("model_key")]
+            model = wrapped[0] if wrapped else DEFAULT_PROBE_MODEL
+            accepted, detail = probe(key, index, model)
+            if accepted:
+                status, payload = call("POST", "/routing/cooldown/reset", key, {"auth_index": index})
+                action = "cleared" if status == 200 else f"clear failed: HTTP {status} {payload.get('error', '')}"
+            else:
+                action = "kept"
+            results.append((account, describe(account_block), model, detail, action))
+            if not accepted:
+                continue  # the account block still stops every model
+
+        for cooldown in model_blocks:
+            model = cooldown.get("model_key")
+            accepted, detail = probe(key, index, model)
+            results.append((account, describe(cooldown), model, detail, "cleared" if accepted else "kept"))
+
+    # Read the state back so the table shows what the proxy holds now.
+    still = {c.get("account"): c["cooldowns"] for c in blocked_accounts(key, args.account)}
+
+    headers = ("Account", "Block", "Test model", "Anthropic", "Action")
+    widths = [max(len(str(r[i])) for r in results + [headers]) for i in range(len(headers))]
+    line = "  ".join("{:<%d}" % w for w in widths)
+    print(line.format(*headers))
+    print(line.format(*("-" * w for w in widths)))
+    for row in results:
+        print(line.format(*row))
+    print()
+    if still:
+        print("Still blocked now:")
+        for account, cooldowns in still.items():
+            for cooldown in cooldowns:
+                print(f"   {account}: {describe(cooldown)}")
+    else:
+        print("No Claude account is blocked now.")
+
+
+if __name__ == "__main__":
+    main()

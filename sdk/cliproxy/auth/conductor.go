@@ -233,8 +233,6 @@ type Manager struct {
 	refreshLoop   *authAutoRefreshLoop
 	// refreshJobs retains queued and running jobs across loop restarts under m.mu.
 	refreshJobs map[string]*authRefreshJob
-	// quotaRecheck probes long Claude quota cooldowns for an early upstream reset.
-	quotaRecheck claudeQuotaRecheckState
 
 	requestPrepareLocks sync.Map
 	// refreshLocks serializes credential refresh per auth ID so concurrent

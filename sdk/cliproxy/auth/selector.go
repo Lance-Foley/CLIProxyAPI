@@ -620,6 +620,7 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = preferSoonestClaudeWeeklyReset(available)
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -635,6 +636,106 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	picked := available[successorIndex(available, s.lastPicked[key])]
 	s.lastPicked[key] = picked.ID
 	return picked, nil
+}
+
+const (
+	claudeFiveHourUtilizationSignal = "Anthropic-Ratelimit-Unified-5h-Utilization"
+	claudeSevenDayResetSignal       = "Anthropic-Ratelimit-Unified-7d-Reset"
+)
+
+// preferSoonestClaudeWeeklyReset narrows a round-robin pool when every candidate
+// has a Claude 7-day reset. The soonest 7-day reset stays in the pool. Another
+// account stays in the pool when its 5-hour utilization is lower than the soonest
+// account. A missing 5-hour signal counts as zero. A missing 7-day reset or an
+// invalid signal leaves the pool unchanged.
+func preferSoonestClaudeWeeklyReset(available []*Auth) []*Auth {
+	if len(available) < 2 {
+		return available
+	}
+	resets := make([]int64, len(available))
+	utilizations := make([]float64, len(available))
+	for i, auth := range available {
+		reset, utilization, ok := claudeWeeklyWindow(auth)
+		if !ok {
+			return available
+		}
+		resets[i] = reset
+		utilizations[i] = utilization
+	}
+
+	earliest := resets[0]
+	threshold := utilizations[0]
+	for i := 1; i < len(available); i++ {
+		if resets[i] < earliest {
+			earliest = resets[i]
+			threshold = utilizations[i]
+			continue
+		}
+		if resets[i] == earliest && utilizations[i] < threshold {
+			threshold = utilizations[i]
+		}
+	}
+
+	pool := make([]*Auth, 0, len(available))
+	for i, auth := range available {
+		if resets[i] == earliest || utilizations[i] < threshold {
+			pool = append(pool, auth)
+		}
+	}
+	if len(pool) == 0 {
+		return available
+	}
+	return pool
+}
+
+// claudeWeeklyWindow reads the 7-day reset and the 5-hour utilization of a Claude auth.
+// The 7-day reset is required. Anthropic omits the 5-hour headers when the account has
+// no 5-hour window, so a missing 5-hour signal counts as no 5-hour load. A 5-hour
+// signal that is present but invalid makes the whole window unknown.
+func claudeWeeklyWindow(auth *Auth) (int64, float64, bool) {
+	if auth == nil || len(auth.Quota.Signals) == 0 {
+		return 0, 0, false
+	}
+	reset, okReset := parseUnixSignal(auth.Quota.Signals[claudeSevenDayResetSignal])
+	if !okReset {
+		return 0, 0, false
+	}
+	rawUtilization, present := auth.Quota.Signals[claudeFiveHourUtilizationSignal]
+	if !present || strings.TrimSpace(rawUtilization) == "" {
+		return reset, 0, true
+	}
+	utilization, okUtilization := parseUtilizationSignal(rawUtilization)
+	if !okUtilization {
+		return 0, 0, false
+	}
+	return reset, utilization, true
+}
+
+func parseUnixSignal(raw string) (int64, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	value, errParse := strconv.ParseInt(raw, 10, 64)
+	if errParse != nil || value <= 0 {
+		return 0, false
+	}
+	return value, true
+}
+
+func parseUtilizationSignal(raw string) (float64, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	value, errParse := strconv.ParseFloat(raw, 64)
+	if errParse != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return 0, false
+	}
+	if value > 1 {
+		value = value / 100
+	}
+	return value, true
 }
 
 // successorIndex returns the index of the first candidate ordered after lastID, wrapping to
